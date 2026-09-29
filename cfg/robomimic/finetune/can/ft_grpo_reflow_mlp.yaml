@@ -1,0 +1,155 @@
+#############################
+env_suite: robomimic
+env_name: can
+
+action_dim: 7
+horizon_steps: 4
+act_steps: 4
+
+obs_dim: 23
+cond_steps: 1
+
+defaults:
+  - _self_
+hydra:
+  run:
+    dir: ${logdir}
+_target_: agent.finetune.grpo.train_grpo_flow_agent.TrainGRPOFlowAgent
+name: ${env_name}_ft_grpo_flow_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}_seed${seed}
+logdir: ${oc.env:REINFLOW_LOG_DIR}/robomimic/finetune/${env_name}_ft_grpo_flow_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+# SFT starting point: our own can pretrain, weak checkpoint state_20 (60% success),
+# same starting weights as the sparse PPO baseline run (60% -> 94.3%).
+base_policy_path: ${oc.env:REINFLOW_LOG_DIR}/robomimic/pretrain/can_pre_reflow_mlp_ta4_td100/2026-09-28_18-22-54_42/checkpoint/state_20.pt
+
+robomimic_env_cfg_path: cfg/robomimic/env_meta/${env_name}.json
+normalization_path: ${oc.env:REINFLOW_DATA_DIR}/robomimic/${env_name}/normalization.npz
+
+seed: 42
+device: cuda:0
+#############################
+denoising_steps: 4
+ft_denoising_steps: 4
+min_std: 0.08
+max_std: 0.14
+#############################
+
+env:
+  n_envs: 64 # v12: 4 groups x 16 (must be divisible by group_size)
+  name: ${env_name}
+  best_reward_threshold_for_success: 1
+  # Read success from the termination flag (wrapper-level done ⟺ task success;
+  # robosuite ignore_done=true never self-terminates). Needed because the repo's
+  # reward-threshold metric is broken under chunked rewards (chunk sum / act_steps
+  # < 1 even on success). Valid in BOTH sparse and dense modes.
+  success_from_termination: true
+  max_episode_steps: 300
+  save_video: false
+  specific:
+    reward_shaping: false # sparse outcome reward (matches the PPO baseline recipe)
+  wrappers:
+    robomimic_lowdim:
+      normalization_path: ${normalization_path}
+      low_dim_keys: ['robot0_eef_pos',
+                    'robot0_eef_quat',
+                    'robot0_gripper_qpos',
+                    'object'] # same order of preprocessed observations
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${act_steps}
+      max_episode_steps: ${env.max_episode_steps}
+      reset_within_step: true
+
+wandb:
+  entity: ${oc.env:REINFLOW_WANDB_ENTITY}
+  project: robomimic-${env_name}-finetune
+  run: ${now:%Y-%m-%d}_${now:%H-%M-%S}_${name}
+  offline_mode: false
+train:
+  n_train_itr: 300 # v13b: user raised the cap (was 201) to give the clean run more room
+  # GRPO rolls COMPLETE episodes; n_steps is only a safety cap on policy calls
+  # per rollout (max_episode_steps / act_steps = 300 / 4 = 75)
+  n_steps: 75
+  group_size: 16 # v12: n_envs 64 -> 4 groups; larger group = better within-group baseline (less winner's-curse noise)
+  # can run v13b (2026-09-29): the CLEAN rerun of v13 (its best recipe) with the
+  # scheduler landmine defused. v13 held a narrow 59-81% band with peak 81.25%
+  # but the inherited first_cycle_steps=100 warm-restart collapsed it at itr 110,
+  # so its true ceiling was never measured. v14/v14b showed lr 2e-5 + neg_scale
+  # 0.5 widen swings without raising the center -- both reverted here.
+  # Kept from v13: anchor 0.075, lr 1e-5, adv_clip 1.0, grad clip 1.0, G=16.
+  # Only changes vs v13: first_cycle_steps 100->1000 (no restart; ~constant lr),
+  # n_train_itr 201->300 (user's call; more room to see the ceiling).
+  adv_batch_center: true
+  adv_positive_only: false
+  adv_clip: 1.0
+  adv_neg_scale: 1.0 # off (v14b evidence: no net gain)
+  adv_eps: 1e-6
+  adv_use_std_norm: true
+  use_ref_reg: true
+  ref_reg_coef: 0.075
+  gamma: 0.999
+  actor_lr: 1.0e-5
+  actor_weight_decay: 0
+  max_grad_norm: 1.0
+  actor_lr_scheduler:
+    type: cosine
+    first_cycle_steps: 1000 # >> n_train_itr: no restart within the run
+    warmup_steps: 10
+    min_lr: 5.0e-6 # stays below peak; barely reached within 300 itrs
+  save_model_freq: 100
+  val_freq: 10
+  render:
+    freq: 1
+    num: 0
+  batch_size: 5000
+  update_epochs: 1 # v12: on v10's base (strictly on-policy single pass)
+  ent_coef: 0.01
+  target_kl: 0.01
+  lr_schedule: fixed
+  verbose: false
+  clip_intermediate_actions: true
+  account_for_initial_stochasticity: true
+  max_noise_hold_ratio: 0.35
+  max_noise_decay_ratio: 0.7
+model:
+  _target_: model.flow.ft_grpo.grpoflow.GRPOFlow
+  device: ${device}
+  policy:
+    _target_: model.flow.mlp_flow.FlowMLP
+    horizon_steps: ${horizon_steps}
+    action_dim: ${action_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    time_dim: 32
+    mlp_dims: [1024, 1024, 1024]
+    activation_type: ReLU
+    out_activation_type: Identity
+    use_layernorm: false
+    residual_style: true
+  # no critic key: GRPO is critic-free (no value network is built anywhere)
+  actor_policy_path: ${base_policy_path}
+  act_dim: ${action_dim}
+  horizon_steps: ${horizon_steps}
+  act_min: -1
+  act_max: 1
+  obs_dim: ${obs_dim}
+  cond_steps: ${cond_steps}
+  noise_scheduler_type: learn_decay
+  inference_steps: ${denoising_steps}
+  ft_denoising_steps: ${ft_denoising_steps}
+  randn_clip_value: 3
+  min_sampling_denoising_std: ${min_std}
+  min_logprob_denoising_std: ${min_std}
+  max_logprob_denoising_std: ${max_std}
+  logprob_min: -1.0
+  logprob_max: 1.0
+  clip_ploss_coef: 0.1 # v12: on v10's base (loose clip)
+  clip_ploss_coef_base: 0.01
+  clip_ploss_coef_rate: 3
+  clip_vloss_coef: null
+  denoised_clip_value: 1.0
+  time_dim_explore: 0
+  learn_explore_time_embedding: false
+  use_time_independent_noise: false
+  noise_hidden_dims: [128,128]
+  logprob_debug_sample: false
+  logprob_debug_recalculate: false
+  explore_net_activation_type: Tanh

@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "This repo builds on ReinFlow; please cite the original paper."
+title: "ReinFlow: Fine-tuning Flow Matching Policy with Online Reinforcement Learning"
+authors:
+  - family-names: Zhang
+    given-names: Tonghe
+  - family-names: Yu
+    given-names: Chao
+  - family-names: Su
+    given-names: Sichang
+  - family-names: Wang
+    given-names: Yu
+year: 2025
+venue: NeurIPS 2025
+url: "https://github.com/ReinFlow/ReinFlow"

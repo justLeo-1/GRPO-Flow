@@ -1,0 +1,100 @@
+######################################################################
+# Our can (low-dim) reflow pretrain config with in-sim eval, mirroring
+# pre_reflow_mlp_sim.yaml for transport. See that file for the rationale:
+# cosine cycle fixed to match n_epochs, test_in_mujoco=true with eval_env,
+# checkpoint chosen by actual success rate instead of final epoch.
+######################################################################
+env_suite: robomimic
+env: can
+
+action_dim: 7
+horizon_steps: 4
+
+obs_dim: 23
+cond_steps: 1
+
+defaults:
+  - _self_
+hydra:
+  run:
+    dir: ${logdir}
+_target_: agent.pretrain.train_reflow_agent.TrainReFlowAgent
+name: ${env}_pre_reflow_mlp_ta${horizon_steps}_td${denoising_steps}
+logdir: ${oc.env:REINFLOW_LOG_DIR}/robomimic/pretrain/${env}_pre_reflow_mlp_ta${horizon_steps}_td${denoising_steps}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+train_dataset_path: ${oc.env:REINFLOW_DATA_DIR}/robomimic/${env}/train.npz
+normalization_path: ${oc.env:REINFLOW_DATA_DIR}/robomimic/${env}/normalization.npz
+robomimic_env_cfg_path: cfg/robomimic/env_meta/${env}.json
+resume_path: null
+denoising_steps: 100
+batch_size: 256
+
+seed: 42
+device: cuda:0
+test_in_mujoco: true
+wandb:
+  entity: ${oc.env:REINFLOW_WANDB_ENTITY}
+  project: robomimic-${env}-pretrain
+  run: ${now:%Y-%m-%d}_${now:%H-%M-%S}_${name}
+  offline_mode: true
+
+train:
+  n_epochs: 2000
+  batch_size: ${batch_size}
+  learning_rate: 1e-4
+  weight_decay: 1e-6
+  lr_scheduler:
+    first_cycle_steps: 2000 # one full cosine cycle over n_epochs (scheduler steps per epoch)
+    warmup_steps: 10
+    min_lr: 1e-5
+  save_model_freq: 50
+  test_freq: 25
+
+# required by PreTrainAgent when test_in_mujoco=true (robomimic branch)
+eval_env:
+  n_envs: 20
+  n_steps: 80 # 80 policy calls x act_steps 4 = 320 env steps > 300 max_episode_steps
+  max_episode_steps: 300
+  best_reward_threshold_for_success: 1
+  wrappers:
+    robomimic_lowdim:
+      normalization_path: ${normalization_path}
+      low_dim_keys: ['robot0_eef_pos',
+                    'robot0_eef_quat',
+                    'robot0_gripper_qpos',
+                    'object'] # same order as the can finetune configs
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${horizon_steps}
+      max_episode_steps: ${eval_env.max_episode_steps}
+      reset_within_step: true
+
+model:
+  _target_: model.flow.reflow.ReFlow
+  network:
+    _target_: model.flow.mlp_flow.FlowMLP
+    horizon_steps: ${horizon_steps}
+    action_dim: ${action_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    time_dim: 32
+    mlp_dims: [1024, 1024, 1024]
+    activation_type: ReLU
+    out_activation_type: Identity
+    use_layernorm: false
+    residual_style: true
+  device: ${device}
+  horizon_steps: ${horizon_steps}
+  action_dim: ${action_dim}
+  act_min: -1
+  act_max: 1
+  obs_dim: ${obs_dim}
+  max_denoising_steps: ${denoising_steps}
+  seed: ${seed}
+  sample_t_type: uniform # beta, logitnormal
+ema:
+  decay: 0.995
+train_dataset:
+  _target_: agent.dataset.sequence.StitchedSequenceDataset
+  dataset_path: ${train_dataset_path}
+  horizon_steps: ${horizon_steps}
+  cond_steps: ${cond_steps}
+  device: ${device}

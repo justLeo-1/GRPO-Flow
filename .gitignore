@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Training artifacts (large / machine-specific)
+log/
+outputs/
+wandb/
+data/
+*.pt
+*.npz
+*.hdf5
+.hydra/
+
+# OS / editor
+.vscode/
+.DS_Store
+Thumbs.db

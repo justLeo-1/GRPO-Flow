@@ -1,0 +1,114 @@
+# Diagnosis — why outcome-level GRPO struggles on long-horizon sparse-reward manipulation
+
+This document collects the failure-mode analysis behind the results in
+`docs/RESULTS.md`. Everything below is backed by a run log or a code pointer in
+this repo.
+
+## 1. Blanket punishment (the core structural issue)
+
+GRPO assigns one episode-level advantage to every step of the episode. In a
+300-step sparse-reward task, a failed episode usually contains a long *correct*
+prefix (approach, grasp) followed by a late mistake. A negative episode
+advantage suppresses all of it — including the good prefix. PPO does not have
+this problem because GAE distributes credit per step via the critic.
+
+Observable signature: repeated mid-training evaluation collapses of 20+ points
+followed by slow recovery, in every GRPO variant.
+
+Mitigations tried (all implemented as switches in `agent/finetune/grpo/grpo_buffer.py`):
+
+| Switch | Effect | Verdict |
+|---|---|---|
+| `adv_batch_center` | removes the step-count-weighted negative-mean bias (failed episodes are longer) | necessary hygiene for signed advantages |
+| `adv_positive_only` | failures get zero advantage (RWR-style) | changes dynamics (higher peaks) but oscillation remains |
+| `adv_clip` (±1.0 z-score) | caps the asymmetric negative z-scores of minority failures | softens punishment ~22%, kills outlier spikes; kept |
+| `adv_neg_scale` (0.5) | scales negative advantages before clipping | no net gain at lr 2e-5 |
+
+## 2. The KL-to-reference anchor has no workable window
+
+Empirical ladder (can, otherwise comparable settings):
+
+| Anchor coef | Behavior |
+|---|---|
+| 1.0 | frozen — no learning at all |
+| 0.1 | stable but flat (never exceeded the start in 9 evals) |
+| 0.075 | narrow-band oscillation (59–81%) |
+| 0.05 | wide oscillation (40–74%) |
+| 0.0 | catastrophic collapse within 20 iterations (75% → 1.6%) |
+
+Why: the anchor is a global spring toward SFT — it cannot distinguish good
+drift (toward higher success) from bad drift (collapse). The oscillation center
+is pinned at the SFT level; improvements get pulled back ("improve a little,
+get pulled back"). Meanwhile the policy-gradient signal at the margin is
+noise-dominated (winner's curse within groups), so the equilibrium never moves.
+
+Related successful prior art: Z-1 (arXiv 2606.31846) makes flow-VLA GRPO work
+*without* any KL anchor — via shared-prefix rollout construction (group members
+differ only in task-critical suffixes), reward filtering, tiny LR (5e-6) and
+grad clipping. Structural variance reduction, not a stronger spring.
+
+## 3. Two upstream bugs found and fixed
+
+### 3a. LR-scheduler dry-run leak
+
+`visualize_lr()` (called once at startup to plot the LR curve) steps the *live*
+scheduler `n_train_itr` times and only resets `CustomScheduler` instances —
+`CosineAnnealingWarmupRestarts` is left advanced. Training therefore silently
+starts at scheduler step `n_train_itr`. Combined with `first_cycle_steps=100`
+(shorter than a 201–300-iteration run), this produces an unintended warm restart
+mid-run (observed: LR ramped 5e-6 → 1e-5 at itr 100 and the policy collapsed
+34% at itr 110 in an otherwise stable run).
+
+Fix (in `agent/finetune/reinflow/train_ppo_agent.py` and
+`agent/finetune/grpo/train_grpo_flow_agent.py`): snapshot
+`scheduler.state_dict()` + optimizer group LRs before the dry-run loop and
+restore afterwards — scheduler-agnostic.
+
+Note: this bug exists in the upstream ReinFlow release; the PPO baseline in
+this repo was also run with a shifted schedule (its conclusion is unaffected).
+
+### 3b. `reward_shaping` flag never reached robosuite
+
+`env/gym_utils/__init__.py` wrote the flag to the top level of `env_meta`, but
+robomimic's `create_env_from_metadata` only forwards `env_meta["env_kwargs"]`.
+Dense staged rewards silently never activated. Fixed by writing into
+`env_kwargs` and verified end-to-end (continuous staged rewards observed).
+
+Lesson: config switches need end-to-end behavioral verification, not just code-path inspection.
+
+## 4. robosuite staged dense rewards are exploitable (loitering)
+
+`PickPlaceCan` with `reward_shaping=True` pays per-step partial credit
+(reaching ≤0.1, grasping 0.35, lifting ≤0.5, hovering ≤0.7) while success pays
+a single +1.0 and *ends* the episode. Loitering at the hover stage therefore
+out-earns completing the task.
+
+Evidence (dense GRPO run): success rate collapsed 66→40→26→26% while episode
+return *rose* 38→44 and episode length grew 239→281 toward the 300-step cap —
+the policy learned to hold the can near the bin instead of placing it.
+
+Implication: off-the-shelf staged rewards are unsafe for RL fine-tuning without
+a dominant completion bonus or a time penalty. This is also why the PPO/GRPO
+comparison in this repo uses sparse rewards (matching the official recipes).
+
+## 5. Data-semantics pitfall (robosuite 1.5.1 vs 1.4.1)
+
+The public robomimic hdf5 stores `object` observations generated by robosuite
+1.5.1; this repo's envs run 1.4.1, whose `object` feature blocks differ (block
+order swapped, different relative-pose conventions). Behavior cloning on the
+stored obs yields ~0% closed-loop success despite a healthy BC loss and accurate
+open-loop action prediction — the eval env feeds the policy *different* object
+features than training did.
+
+Fix: `scripts/regen_observations.py` recomputes observations from the flat
+MuJoCo `states` array with the *local* robosuite via `env.reset_to()` (verified
+frame-by-frame against the live env, max deviation ~1e-8).
+
+## 6. Metric pitfall: the repo's training-time "success rate" field
+
+Under chunked actions (`act_steps=4`), the log field computes
+`max(chunk_reward_sum)/act_steps >= 1`, which is never satisfied by sparse
+rewards (a single +1 step gives 0.25). All "success rate = 0.00%" entries in
+early logs are this artifact, not policy failure. Ground truth used throughout:
+sparse mode → mean episode reward (exactly the success rate); or the
+termination flag (`success_from_termination` in our agents).

@@ -1,0 +1,168 @@
+#############################
+env_suite: robomimic
+env_name: transport
+
+action_dim: 14
+horizon_steps: 8
+act_steps: 8
+
+obs_dim: 59
+cond_steps: 1
+
+defaults:
+  - _self_
+hydra:
+  run:
+    dir: ${logdir}
+_target_: agent.finetune.grpo.train_grpo_flow_agent.TrainGRPOFlowAgent
+name: ${env_name}_ft_grpo_flow_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}_seed${seed}
+logdir: ${oc.env:REINFLOW_LOG_DIR}/robomimic/finetune/${env_name}_ft_grpo_flow_mlp_ta${horizon_steps}_td${denoising_steps}_tdf${ft_denoising_steps}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
+# TODO: point this at the checkpoint from OUR OWN upcoming pretrain run, produced by
+#   python script/run.py --config-dir=cfg/robomimic/pretrain/transport --config-name=pre_reflow_mlp
+# which writes to ${oc.env:REINFLOW_LOG_DIR}/robomimic/pretrain/transport_pre_reflow_mlp_ta8_td100/<timestamp>_${seed}/checkpoint/state_*.pt
+base_policy_path: ${oc.env:REINFLOW_LOG_DIR}/robomimic/pretrain/transport_pre_reflow_mlp_ta8_td100/2026-09-28_10-04-33_42/checkpoint/state_300.pt
+
+robomimic_env_cfg_path: cfg/robomimic/env_meta/${env_name}.json
+normalization_path: ${oc.env:REINFLOW_DATA_DIR}/robomimic/${env_name}/normalization.npz
+
+seed: 42
+device: cuda:0
+#############################
+denoising_steps: 4
+ft_denoising_steps: 4
+min_std: 0.08
+max_std: 0.14
+#############################
+
+env:
+  n_envs: 50
+  name: ${env_name}
+  best_reward_threshold_for_success: 1
+  max_episode_steps: 800
+  save_video: false
+  wrappers:
+    robomimic_lowdim:
+      normalization_path: ${normalization_path}
+      low_dim_keys: ['robot0_eef_pos',
+                    'robot0_eef_quat',
+                    'robot0_gripper_qpos',
+                    "robot1_eef_pos",
+                    "robot1_eef_quat",
+                    "robot1_gripper_qpos",
+                    'object'] # same order of preprocessed observations
+    multi_step:
+      n_obs_steps: ${cond_steps}
+      n_action_steps: ${act_steps}
+      max_episode_steps: ${env.max_episode_steps}
+      reset_within_step: true
+
+wandb:
+  entity: ${oc.env:REINFLOW_WANDB_ENTITY}
+  project: robomimic-${env_name}-finetune
+  run: ${now:%Y-%m-%d}_${now:%H-%M-%S}_${name}
+  offline_mode: false
+train:
+  n_train_itr: 400  # GRPO collects fewer samples per itr (complete episodes); compare on env-steps axis
+  # GRPO rolls COMPLETE episodes; n_steps is only a safety cap on policy calls
+  # per rollout (max_episode_steps / act_steps = 800 / 8 = 100)
+  n_steps: 100
+  group_size: 5 # n_envs 50 -> 10 groups of episodes sharing the same initial state
+  # v6 (2026-09-28): per-batch centering of per-step advantages. Group-relative
+  # centering zeroes the mean per EPISODE, but failed episodes are LONGER (800-step
+  # time limit) than successful ones (early truncation), so the step-weighted batch
+  # mean is negative -> constant net downward pressure (v5: eval 0.44 -> 0.28).
+  adv_batch_center: true
+  adv_eps: 1e-6
+  adv_use_std_norm: true
+  # v3 (2026-09-28): enable KL-style anchor to the frozen SFT reference policy
+  # (standard GRPO: beta * KL(pi_theta || pi_ref); implemented as W2-style action MSE
+  # under the same recorded initial noise z, since chain KL has no closed form for flows).
+  # Rationale: SFT is decent (55%) and v1 showed the un-anchored policy can collapse.
+  # v4 (2026-09-28): v3 (coef 0.1) still oscillated below SFT (eval 0.44 -> 0.20,
+  # train reward churning in 0.02-0.12) -- the anchor rescued but could not prevent
+  # drift-down. Switch the anchor from "rescue" to "prevention": coef 0.1 -> 1.0
+  # (anchor force comparable to pg_loss scale once drifted), and update_epochs 5 -> 2
+  # (less off-policy drift per iteration).
+  # v9 (2026-09-28): v8 (lr 3.5e-5, anchor 0.1) still floored (approx_kl 3.8e-7,
+  # eval flat 0.40 at itr 10) -- the damping source is the anchor, not the step size.
+  # Drop anchor to 0.05 (nearly anchorless); batch centering is the directional
+  # safeguard now. Last autonomous config change per the agreed playbook.
+  use_ref_reg: true
+  ref_reg_coef: 0.05
+  gamma: 0.999
+  # Collapse fix (v2, 2026-09-28): run v1 collapsed by itr ~5 (train reward 0.26 -> 0.00,
+  # then all groups degenerate -> pg_loss = 0). Fixes applied:
+  #  - ent_coef 0.01 -> 0: with no PG signal the entropy bonus alone inflates the
+  #    exploration noise (death spiral driver). Also ReinFlow README: "turn it off first".
+  #  - actor_lr 4.5e-5 -> 2e-5: outcome-broadcast advantages (same A over ~100 chain
+  #    decisions per episode) are much higher-variance than per-step GAE; halve the lr.
+  # v8 (2026-09-28): v7 (centering + anchor 0.1 + lr 2e-5) still pinned
+  # (approx_kl ~1.3e-7 floored, eval flat 0.44 -> 0.30 at itr 10). Direction is fixed
+  # by centering; what's missing is step size. Raise lr 2e-5 -> 3.5e-5 (min_lr
+  # 1e-5 -> 1.5e-5 to keep the cosine ratio). v1's collapse at 4.5e-5 predates
+  # centering + anchor, so 3.5e-5 with both guards is a reasonable middle.
+  actor_lr: 3.5e-5
+  actor_weight_decay: 0
+  actor_lr_scheduler:
+    type: cosine
+    first_cycle_steps: 100
+    warmup_steps: 10
+    min_lr: 1.5e-5
+  save_model_freq: 100
+  val_freq: 10
+  render:
+    freq: 1
+    num: 0
+  batch_size: 10000
+  update_epochs: 2  # v4: 5 -> 2, less off-policy drift per iteration
+  ent_coef: 0.0
+  target_kl: 0.01
+  lr_schedule: fixed
+  verbose: false
+  clip_intermediate_actions: true
+  account_for_initial_stochasticity: true
+  max_noise_hold_ratio: 0.35
+  max_noise_decay_ratio: 0.7
+model:
+  _target_: model.flow.ft_grpo.grpoflow.GRPOFlow
+  device: ${device}
+  policy:
+    _target_: model.flow.mlp_flow.FlowMLP
+    horizon_steps: ${horizon_steps}
+    action_dim: ${action_dim}
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    time_dim: 32
+    mlp_dims: [1024, 1024, 1024]
+    activation_type: ReLU
+    out_activation_type: Identity
+    use_layernorm: false
+    residual_style: true
+  # no critic key: GRPO is critic-free (no value network is built anywhere)
+  actor_policy_path: ${base_policy_path}
+  act_dim: ${action_dim}
+  horizon_steps: ${horizon_steps}
+  act_min: -1
+  act_max: 1
+  obs_dim: ${obs_dim}
+  cond_steps: ${cond_steps}
+  noise_scheduler_type: learn_decay
+  inference_steps: ${denoising_steps}
+  ft_denoising_steps: ${ft_denoising_steps}
+  randn_clip_value: 3
+  min_sampling_denoising_std: ${min_std}
+  min_logprob_denoising_std: ${min_std}
+  max_logprob_denoising_std: ${max_std}
+  logprob_min: -1.0
+  logprob_max: 1.0
+  clip_ploss_coef: 0.01
+  clip_ploss_coef_base: 0.01
+  clip_ploss_coef_rate: 3
+  clip_vloss_coef: null
+  denoised_clip_value: 1.0
+  time_dim_explore: 0
+  learn_explore_time_embedding: false
+  use_time_independent_noise: false
+  noise_hidden_dims: [128,128]
+  logprob_debug_sample: false
+  logprob_debug_recalculate: false
+  explore_net_activation_type: Tanh
